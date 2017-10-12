@@ -224,3 +224,482 @@ resource "aws_subnet" "private-subnets-2" {
   }
 }
 ```
+
+This will create a VPC for us with 3 sets of subnets, 2 private and 1 public (meaning will have the IGW as default gateway). For the private subnets we need to create a NAT instance to be used as internet gateway. We can create a new `.tf` file `vpc_nat_instance.tf` lets say where we create the resource:
+
+```hcl
+/*== NAT INSTANCE IAM PROFILE ==*/
+resource "aws_iam_instance_profile" "nat" {
+  name  = "${var.vpc["tag"]}-nat-profile"
+  roles = ["${aws_iam_role.nat.name}"]
+}
+
+resource "aws_iam_role" "nat" {
+  name = "${var.vpc["tag"]}-nat-role"
+  path = "/"
+  assume_role_policy = <<EOF
+{
+  "Version": "2008-10-17",
+  "Statement": [
+    {
+      "Action": "sts:AssumeRole",
+      "Principal": {"AWS": "*"},
+      "Effect": "Allow",
+      "Sid": ""
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_iam_policy" "nat" {
+  name = "${var.vpc["tag"]}-nat-policy"
+  path = "/"
+  description = "NAT IAM policy"
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeRouteTables",
+        "ec2:CreateRoute",
+        "ec2:ReplaceRoute"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_iam_policy_attachment" "nat" {
+  name       = "${var.vpc["tag"]}-nat-attachment"
+  roles      = ["${aws_iam_role.nat.name}"]
+  policy_arn = "${aws_iam_policy.nat.arn}"
+}
+
+/*=== NAT INSTANCE ASG ===*/
+resource "aws_autoscaling_group" "nat" {
+  name                      = "${var.vpc["tag"]}-nat-asg"
+  availability_zones        = "${split(",", lookup(var.azs, var.provider["region"]))}"
+  vpc_zone_identifier       = ["${aws_subnet.public-subnets.*.id}"]
+  max_size                  = 1
+  min_size                  = 1
+  health_check_grace_period = 60
+  default_cooldown          = 60
+  health_check_type         = "EC2"
+  desired_capacity          = 1
+  force_delete              = true
+  launch_configuration      = "${aws_launch_configuration.nat.name}"
+  tag {
+    key                     = "Name"
+    value                   = "NAT-${var.vpc["tag"]}"
+    propagate_at_launch     = true
+  }
+  tag {
+    key                     = "Environment"
+    value                   = "${lower(var.vpc["tag"])}"
+    propagate_at_launch     = true
+  }
+  tag {
+    key                     = "Type"
+    value                   = "nat"
+    propagate_at_launch     = true
+  }
+  tag {
+    key                     = "Role"
+    value                   = "bastion"
+    propagate_at_launch     = true
+  }
+  lifecycle {
+    create_before_destroy   = true
+  }
+}
+
+resource "aws_launch_configuration" "nat" {
+  name_prefix                 = "${var.vpc["tag"]}-nat-lc-"
+  image_id                    = "${lookup(var.images, var.provider["region"])}"
+  instance_type               = "${var.nat["instance_type"]}"
+  iam_instance_profile        = "${aws_iam_instance_profile.nat.name}"
+  key_name                    = "${var.key_name}"
+  security_groups             = ["${aws_security_group.nat.id}"]
+  associate_public_ip_address = true
+  user_data                   = "${data.template_file.nat.rendered}"
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+data "template_file" "nat" {
+  template = "${file("${var.nat["filename"]}")}"
+  vars {
+    cidr = "${var.vpc["cidr_block"]}"
+  }
+}
+```
+
+We create the NAT instance in a Auto Scaling group since being a vital part of the infrastructure we want it to be highly available. This means that in case of a failure, the ASG will launch a new one. This instance then needs to configure it self as a gateway for the public subnets for which we create and attach to it an IAM role with specific permissions. Lastly the instance will use the `userdata_nat_asg.sh` file (see the variables file) given to it via `user-data` to setup the routing for the private subnets. The scipt is given below:
+
+```bash
+#!/bin/bash -ve
+
+echo iptables-persistent iptables-persistent/autosave_v4 boolean true |debconf-set-selections
+
+echo iptables-persistent iptables-persistent/autosave_v6 boolean true |debconf-set-selections
+
+rm -rf /var/lib/apt/lists/*
+sed -e '/^deb.*security/ s/^/#/g' -i /etc/apt/sources.list
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y -m -qq
+apt-get -y install conntrack iptables-persistent nfs-common > /tmp/nat.log
+
+[[ -s $(modinfo -n ip_conntrack) ]] \
+  && modprobe ip_conntrack          \
+  && echo ip_conntrack | tee -a /etc/modules
+
+/sbin/sysctl -w net.ipv4.ip_forward=1
+/sbin/sysctl -w net.ipv4.conf.eth0.send_redirects=0
+/sbin/sysctl -w net.netfilter.nf_conntrack_max=131072
+
+echo "net.ipv4.ip_forward=1"                  >> /etc/sysctl.conf
+echo "net.ipv4.conf.eth0.send_redirects=0"    >> /etc/sysctl.conf
+echo "net.netfilter.nf_conntrack_max=131072"  >> /etc/sysctl.conf
+
+/sbin/iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+/sbin/iptables -A FORWARD -m conntrack --ctstate INVALID -j DROP
+/sbin/iptables -A INPUT -p tcp --syn -m limit --limit 5/s -i eth0 -j ACCEPT
+/sbin/iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+/sbin/iptables -t nat -A POSTROUTING -o eth0 -s ${cidr} -j MASQUERADE
+sleep 1
+
+wget -P /usr/local/bin https://s3-ap-southeast-2.amazonaws.com/encompass-public/ha-nat-terraform.sh
+
+[[ ! -x "/usr/local/bin/ha-nat-terraform.sh" ]] && chmod +x /usr/local/bin/ha-nat-terraform.sh
+
+/bin/bash /usr/local/bin/ha-nat-terraform.sh
+
+cat > /etc/profile.d/user.sh <<END
+HISTSIZE=1000
+HISTFILESIZE=40000
+HISTTIMEFORMAT="[%F %T %Z] "
+export HISTSIZE HISTFILESIZE HISTTIMEFORMAT
+END
+
+sed -e '/^#deb.*security/ s/^#//g' -i /etc/apt/sources.list
+exit 0
+```
+
+It configures the firewall and the NAT rules and executes the `ha-nat-terraform.sh` script fetched from a S3 bucket.
+
+In the same time we create Security Groups, or instance firewalls in AWS terms, to attach to the subnets and the NAT instance we are going to create:
+
+```hcl
+/*=== SECURITY GROUPS ===*/
+resource "aws_security_group" "default" {
+  name = "${var.vpc["tag"]}-default"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.vpc["cidr_block"]}"]
+  }
+  ingress {
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["${var.vpc["cidr_block"]}"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-default-security-group"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_security_group" "nat" {
+  name = "${var.vpc["tag"]}-nat"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 123
+    to_port     = 123
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["${var.vpc["cidr_block"]}"]
+  }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["${var.vpc["cidr_block"]}"]
+  }
+  egress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 123
+    to_port     = 123
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-nat-security-group"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_security_group" "public" {
+  name = "${var.vpc["tag"]}-public"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-public-security-group"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_security_group" "private" {
+  name = "${var.vpc["tag"]}-private"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${aws_subnet.private-subnets.*.cidr_block}"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-private-security-group"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_security_group" "private-2" {
+  name = "${var.vpc["tag"]}-private-2"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${aws_subnet.private-subnets-2.*.cidr_block}"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-private-2-security-group"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+```
+
+Next we need to sort out the VPC routing, create routing tables and associate them with the subnets. Create a new file `vpc_routing_tables.tf`:
+
+```hcl
+/*=== ROUTING TABLES ===*/
+resource "aws_route_table" "public-subnet" {
+  vpc_id = "${aws_vpc.environment.id}"
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = "${aws_internet_gateway.environment.id}"
+  }
+  tags {
+    Name        = "${var.vpc["tag"]}-public-subnet-route-table"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_route_table_association" "public-subnet" {
+  count          = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  subnet_id      = "${element(aws_subnet.public-subnets.*.id, count.index)}"
+  route_table_id = "${aws_route_table.public-subnet.id}"
+}
+
+resource "aws_route_table" "private-subnet" {
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-private-subnet-route-table"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_route_table_association" "private-subnet" {
+  count          = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  subnet_id      = "${element(aws_subnet.private-subnets.*.id, count.index)}"
+  route_table_id = "${aws_route_table.private-subnet.id}"
+}
+
+resource "aws_route_table" "private-subnet-2" {
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-private-subnet-2-route-table"
+    Environment = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_route_table_association" "private-subnet-2" {
+  count          = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  subnet_id      = "${element(aws_subnet.private-subnets-2.*.id, count.index)}"
+  route_table_id = "${aws_route_table.private-subnet-2.id}"
+}
+```
+
+To wrap it up I would like to receive some notifications in case of Autoscaling events so we create `vpc_notifications.tf` file:
+
+```hcl
+/*=== AUTOSCALING NOTIFICATIONS ===*/
+resource "aws_autoscaling_notification" "main" {
+  group_names = [
+    "${aws_autoscaling_group.nat.name}"
+  ]
+  notifications  = [
+    "autoscaling:EC2_INSTANCE_LAUNCH",
+    "autoscaling:EC2_INSTANCE_TERMINATE",
+    "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
+    "autoscaling:EC2_INSTANCE_TERMINATE_ERROR"
+  ]
+  topic_arn = "${aws_sns_topic.main.arn}"
+}
+
+resource "aws_sns_topic" "main" {
+  name = "${lower(var.vpc["tag"])}-sns-topic"
+
+  provisioner "local-exec" {
+    command = "aws sns subscribe --topic-arn ${self.arn} --protocol email --notification-endpoint ${var.vpc["sns_email"]}"
+  }
+}
+```
+
+As we further build our infrastructure we will use more Auto Scaling configurations and we can add those to the above resource under `group_names`.
+
+At the end, some outputs we can use if needed:
+
+```hcl
+/*=== OUTPUTS ===*/
+output "num-zones" {
+  value =  "${length(lookup(var.azs, var.provider[region]))}"
+}
+
+output "vpc-id" {
+  value = "${aws_vpc.environment.id}"
+}
+
+output "public-subnet-ids" {
+  value = "${join(",", aws_subnet.public-subnets.*.id)}"
+}
+
+output "private-subnet-ids" {
+  value = "${join(",", aws_subnet.private-subnets.*.id)}"
+}
+
+output "private-subnet-2-ids" {
+  value = "${join(",", aws_subnet.private-subnets-2.*.id)}"
+}
+
+output "autoscaling_notification_sns_topic" {
+  value = "${aws_sns_topic.main.id}"
+}
+```
+
+At the end we run:
+
+```bash
+$ terraform plan -var-file provider-credentials.tfvars -var-file vpc_environment.tfvars -out vpc.tfplan
+```
+
+to test and create the plan and then:
+```bash
+$ terraform apply vpc.tfplan
+```
+
+to create our VPC. When finished we can destroy the infrastructure:
+```bash
+$ terraform destroy vpc.tfplan --force
+```
