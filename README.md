@@ -703,3 +703,142 @@ to create our VPC. When finished we can destroy the infrastructure:
 ```bash
 $ terraform destroy vpc.tfplan --force
 ```
+
+### Adding ELB to the mix
+
+Since we are building highly available infrastructure we are going to need a public ELB to put our application servers behind it. Under assumption that the app is listening on port 8080 we can add the following:
+
+```hcl
+variable "app" {
+  default = {
+    elb_ssl_cert_arn  = ""
+    elb_hc_uri        = ""
+    listen_port_http  = ""
+    listen_port_https = ""
+  }
+}
+```
+
+to our `vpc_environment.tf` file and set the values by putting:
+
+```hcl
+app = {
+  instance_type         = "<app-instance-type>"
+  host_name             = "<app-host-name>"
+  elb_ssl_cert_arn      = "<elb-ssl-cert-arn>"
+  elb_hc_uri            = "<app-health-check-path>"
+  listen_port_http      = "8080"
+  listen_port_https     = "443"
+  domain                = "<domain-name>"
+  zone_id               = "<domain-zone-id>"
+}
+```
+
+in our `vpc_environment.tfvars` file. Now we can create the ELB by creating the `vpc_elb.tf` file with following content:
+
+```hcl
+/*== ELB ==*/
+resource "aws_elb" "app" {
+  /* Requiered for EC2 ELB only
+    availability_zones = "${var.zones}"
+  */
+  name                  = "${var.vpc["tag"]}-elb-app"
+  subnets               = ["${aws_subnet.public-subnets.*.id}"]
+  security_groups       = ["${aws_security_group.elb.id}"]
+  listener {
+    instance_port       = "${var.app["listen_port_http"]}"
+    instance_protocol   = "http"
+    lb_port             = 443
+    lb_protocol         = "https"
+    ssl_certificate_id  = "${var.app["elb_ssl_cert_arn"]}"
+  }
+  listener {
+    instance_port       = "${var.app["listen_port_http"]}"
+    instance_protocol   = "http"
+    lb_port             = 80
+    lb_protocol         = "http"
+  }
+  health_check {
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+    target              = "HTTP:${var.app["listen_port_http"]}${var.app["elb_hc_uri"]}"
+    interval            = 10
+  }
+  cross_zone_load_balancing   = true
+  idle_timeout                = 960  # set it higher than the conn. timeout of the backend servers
+  connection_draining         = true
+  connection_draining_timeout = 300
+  tags {
+    Name = "${var.vpc["tag"]}-elb-app"
+    Type = "elb"
+  }
+}
+
+/* In case we need sticky sessions
+resource "aws_lb_cookie_stickiness_policy" "app" {
+    name = "${var.vpc["tag"]}-elb-app-policy"
+    load_balancer = "${aws_elb.app.id}"
+    lb_port = 443
+    cookie_expiration_period = 960
+}
+*/
+
+/* CREATE CNAME DNS RECORD FOR THE ELB */
+resource "aws_route53_record" "app" {
+  zone_id = "${var.app["zone_id"]}"
+  name    = "${lower(var.vpc["tag"])}.${var.app["name"]}"
+  type    = "CNAME"
+  ttl     = "60"
+  records = ["${aws_elb.app.dns_name}"]
+}
+```
+
+The ELB does not support redirections so the app needs to deal with redirecting users from port 80/8080 to 443 for fully secure SSL operation.
+
+Finally, the Security Group for the ELB in `vpc_security.tf` file:
+
+```hcl
+resource "aws_security_group" "elb" {
+  name = "${var.vpc["tag"]}-elb"
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name        = "${var.vpc["tag"]}-elb-security-group"
+    Environment = "${var.vpc["tag"]}"
+  }
+}
+```
+
+and we are done.
+
+To get some outputs we are interested in from the ELB resource we can add this:
+
+```hcl
+output "elb-app-public-dns" {
+  value = "${aws_elb.app.dns_name}"
+}
+
+output "route53-app-public-dns" {
+  value = "${aws_route53_record.app.fqdn}"
+}
+```
+
+to the `outputs.tf` file.
