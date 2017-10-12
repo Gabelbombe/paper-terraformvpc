@@ -842,3 +842,37 @@ output "route53-app-public-dns" {
 ```
 
 to the `outputs.tf` file.
+
+### Conclusion
+
+As we add more infrastructure to the VPC we can make some improvements to the above code by creating modules for the common tasks like Autoscaling Groups and Launch Configurations, ELB’s, IAM Profiles etc., see [Creating Modules](https://www.terraform.io/docs/modules/create.html) for details.
+
+Not everything can be done this way though. For example the repetitive code like:
+
+```hcl
+resource "aws_subnet" "public-subnets" {
+  vpc_id            = "${aws_vpc.environment.id}"
+  count             = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  cidr_block        = "${cidrsubnet(var.vpc["cidr_block"], var.vpc["subnet_bits"], count.index)}"
+  availability_zone = "${element(split(",", lookup(var.azs, var.provider["region"])), count.index)}"
+  tags {
+    Name            = "${var.vpc["tag"]}-public-subnet-${count.index}"
+    Environment     = "${lower(var.vpc["tag"])}"
+  }
+  map_public_ip_on_launch = true
+}
+```
+
+is a great candidate for a module except Terraform does not (yet) support `count` parameter inside modules, see [Support issue #953](https://github.com/hashicorp/terraform/issues/953)
+
+It’s graphing feature might come handy in obtaining a logical diagram of the infrastructure we are creating:
+
+![tf-graph](https://raw.githubusercontent.com/ehime/paper-terarformvpc/master/assets/01-arch-tfgraph.png "Terraform Graph of Infrastructure")
+
+```bash
+$ terraform graph | dot -Tpng > graph.png
+```
+
+And of course there is [Atlas](https://www.hashicorp.com/atlas.html) from HashiCorp, a paid DevOps Infrastructure Suite that provides collaboration, validation and automation features if professional support for those who need it.
+
+Apart from couple of shortcomings mentioned, Terraform is really a powerful tool for creating and managing infrastructure. With its Templates and Provisioners it lays the foundation for other CM and automation tools like Ansible, which is our CM (Configuration Manager) of choice, to deploy systems in an infrastructure environment.
