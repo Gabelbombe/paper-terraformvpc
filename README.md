@@ -11,7 +11,7 @@ To install terraform follow the simple steps from the install web page [Getting 
 
 ### Notes before we start
 
-First let me mention that the below code has been adjusted to work with the latest Terraform and has been successfully tested with version `v0.10.3` It has been running for long time now and been used many times to create production VPC’s in AWS. It’s been based on `CloudFormation` templates I’ve written for the same purpose at some point in 2014 during the quest of converting our infrastructure into code.
+First let me mention that the below code has been adjusted to work with the latest Terraform and has been successfully tested with version `v0.10.3` It has been running for long time now and been used many times to create production VPC's in AWS. It's been based on `CloudFormation` templates I've written for the same purpose at some point in 2014 during the quest of converting our infrastructure into code.
 
 What is this going to do is:
 
@@ -124,6 +124,103 @@ variable "env_domain" {
   default = {
     name    = "unknown"
     zone_id = "unknown"
+  }
+}
+```
+
+I have created most of the variables as generic and then passing on their values via separate `.tfvars` file `vpc_environment.tfvars`:
+
+```hcl
+vpc = {
+  tag                   = "TFTEST"
+  owner_id              = "<owner-id>"
+  cidr_block            = "10.99.0.0/20"
+  subnet_bits           = "4"
+  sns_email             = "<sns-email>"
+}
+key_name                = "<ssh-key>"
+nat.instance_type       = "m3.medium"
+env_domain = {
+  name                  = "mydomain.com"
+  zone_id               = "<zone-id>"
+}
+```
+Terraform does not support (yet) interpolation by referencing another variable in a variable name (see [Terraform issue #2727](https://github.com/hashicorp/terraform/issues/2727)) nor usage of an array as an element of a map. These are couple of shortcomings but If you have used AWS's CloudFormation you would have faced similar "issues". After all these tools are not really a programming language so we have to accept them as they are and try to make the best of it.
+
+We can see I have separated the provider stuff from the rest of it including the resource so I can easily share my project without exposing sensitive data. For example I can create GitHub repository out of my project directory and put the `provider-credentials.tfvariables` file in `.gitignore` so it never gets accidentally uploaded.
+
+
+### Initial trial by fire
+
+Now is time to do the first test. After substituting all values in `<>` with real ones we run:
+
+```hcl
+$ terraform plan -var-file provider-credentials.tfvars -var-file vpc_environment.tfvars -out vpc.tfplan
+```
+
+Inside the directory and check the output. If this goes without any errors then we can proceed to next step, otherwise we have to go back and fix the errors terraform has printed out. To apply the planned changes then we run:
+
+```hcl
+$ terraform apply vpc.tfplan
+```
+
+but it’s too early for that at this stage since we have nothing to apply yet.
+
+We can start creating resources now, starting with a VPC, subnets and IGW (Internet Gateway). We want our VPC to be created in a region with 3 AZ’s (Availability Zones) so we can spread our future instance nicely for HA. We create a new `.tf` file `vpc.tf`:
+
+```hcl
+/*=== VPC AND SUBNETS ===*/
+resource "aws_vpc" "environment" {
+  cidr_block           = "${var.vpc["cidr_block"]}"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags {
+    Name                = "VPC-${var.vpc["tag"]}"
+    Environment         = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_internet_gateway" "environment" {
+  vpc_id = "${aws_vpc.environment.id}"
+  tags {
+    Name                = "${var.vpc["tag"]}-internet-gateway"
+    Environment         = "${lower(var.vpc["tag"])}"
+  }
+}
+
+resource "aws_subnet" "public-subnets" {
+  vpc_id                = "${aws_vpc.environment.id}"
+  count                 = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  cidr_block            = "${cidrsubnet(var.vpc["cidr_block"], var.vpc["subnet_bits"], count.index)}"
+  availability_zone     = "${element(split(",", lookup(var.azs, var.provider["region"])), count.index)}"
+  tags {
+    Name                = "${var.vpc["tag"]}-public-subnet-${count.index}"
+    Environment         = "${lower(var.vpc["tag"])}"
+  }
+  map_public_ip_on_launch = true
+}
+
+resource "aws_subnet" "private-subnets" {
+  vpc_id                = "${aws_vpc.environment.id}"
+  count                 = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  cidr_block            = "${cidrsubnet(var.vpc["cidr_block"], var.vpc["subnet_bits"], count.index + length(split(",", lookup(var.azs, var.provider["region"]))))}"
+  availability_zone     = "${element(split(",", lookup(var.azs, var.provider["region"])), count.index)}"
+  tags {
+    Name                = "${var.vpc["tag"]}-private-subnet-${count.index}"
+    Environment         = "${lower(var.vpc["tag"])}"
+    Network             = "private"
+  }
+}
+
+resource "aws_subnet" "private-subnets-2" {
+  vpc_id                = "${aws_vpc.environment.id}"
+  count                 = "${length(split(",", lookup(var.azs, var.provider["region"])))}"
+  cidr_block            = "${cidrsubnet(var.vpc["cidr_block"], var.vpc["subnet_bits"], count.index + (2 * length(split(",", lookup(var.azs, var.provider["region"])))))}"
+  availability_zone     = "${element(split(",", lookup(var.azs, var.provider["region"])), count.index)}"
+  tags {
+    Name                = "${var.vpc["tag"]}-private-subnet-2-${count.index}"
+    Environment         = "${lower(var.vpc["tag"])}"
+    Network             = "private"
   }
 }
 ```
