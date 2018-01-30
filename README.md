@@ -1,4 +1,4 @@
-# Building VPC with Terraform in Amazon AWS
+# Building VPC with Terraform in Amazon Web Services
 
 ### Introduction
 
